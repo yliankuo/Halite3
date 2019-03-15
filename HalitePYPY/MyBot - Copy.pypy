@@ -1,0 +1,529 @@
+#!/usr/bin/env pypy
+import hlt
+from hlt import constants
+from hlt.positionals import Direction
+import random
+import logging
+import heapq
+import itertools
+import math
+import time
+import sys
+from hlt.game_map import  MapCell
+from hlt.game_map import PriorityQueue
+
+game_map = None
+bestfrontier = PriorityQueue()
+
+def getcost(pos):
+    total = 0
+    for p in pos.get_surrounding_cardinals():
+        total += game_map[p].halite_amount
+    return math.ceil(total / len(pos.get_surrounding_cardinals()))
+
+def predictcost(pos1,pos2):
+    return (getcost(pos1) + getcost(pos2))/2
+
+def pathfindhome(pos,tar):
+    pos = game_map.normalize(pos)
+    tar = game_map.normalize(tar)
+    hopen = PriorityQueue()
+    hopen.put(pos,0)
+    parent = {}
+    cost = {}
+    parent[str(pos)] = None
+    cost[str(pos)] = 0
+    while not hopen.empty():
+        temp = hopen.get()
+        if temp == tar:
+            break
+        if temp in alldropoffs:
+            tcost = 600
+        tcost = getcost(temp)
+        shuffle = temp.get_surrounding_cardinals()
+        random.shuffle(shuffle)
+        for p in shuffle:
+            pcost = cost[str(temp)] + tcost
+            if str(p) not in parent or pcost < cost[str(p)]:
+                cost[str(p)] = pcost
+                hopen.put(p,pcost + game_map.calculate_distance(p,tar))
+                parent[str(p)] = temp
+    if str(tar) not in parent:
+        return None
+    temp = tar
+    par = parent[str(temp)]
+    result = {}
+    while par:
+        result[str(par)] = temp
+        temp = par
+        par = parent[str(par)]
+    temp = pos
+    return result
+
+def pathfind(pos,tar):
+    pos = game_map.normalize(pos)
+    tar = game_map.normalize(tar)
+    hopen = PriorityQueue()
+    hopen.put(pos, 0)
+    parent = {}
+    cost = {}
+    parent[str(pos)] = None
+    cost[str(pos)] = 0
+    while not hopen.empty():
+        temp = hopen.get()
+        if temp == tar:
+            break
+        tcost = 0
+        if temp in alldropoffs:
+            tcost = 100
+        shuffle = temp.get_surrounding_cardinals()
+        random.shuffle(shuffle)
+        for p in shuffle:
+            pcost = cost[str(temp)] + tcost
+            if str(p) not in parent or pcost < cost[str(p)]:
+                cost[str(p)] = pcost
+                hopen.put(p, pcost + game_map.calculate_distance(p, tar))
+                parent[str(p)] = temp
+    if str(tar) not in parent:
+        return None
+    temp = tar
+    par = parent[str(temp)]
+    result = {}
+    while par:
+        result[str(par)] = temp
+        temp = par
+        par = parent[str(par)]
+    temp = pos
+    return result
+
+
+""" <<<Game Begin>>> """
+# This game object contains the initial game state.
+game = hlt.Game()
+# At this point "game" variable is populated with initial map data.
+# This is a good place to do computationally expensive start-up pre-processing.
+# As soon as you call "ready" function below, the 2 second per turn timer will start.
+
+total_halite,ranksbyhalite = game.game_map.get_total_halite()
+game.game_map.log_density(5)
+logging.info("Starting Map Halite: " + str(total_halite))
+avg_halite = math.ceil((total_halite / (game.game_map.width * game.game_map.height)))
+
+game.ready("MyPythonBot")
+
+# Now that your bot is initialized, save a message to yourself in the log file with some important information.
+#   Here, you log here your id, which you can always fetch from the game object by using my_id.
+logging.info("Successfully created bot! My Player ID is {}.".format(game.my_id))
+
+""" <<<Game Loop>>> """
+
+path = {}
+back = {}
+tardict = {}
+targets =[]
+command_queue = []
+temp_targets = []
+movers = []
+collected = 5000
+used_halite = 0
+dropoffs = []
+me = game.me
+game_map = game.game_map
+dropoffs.append(game_map[me.shipyard].position)
+dropoff_requests = {}
+halite_modifier = 0
+returning = []
+ending = []
+avg_remaining_halite = 0
+alldropoffs = []
+def getdisthome(pos):
+    disthome = 100000
+    result = pos
+    for p in dropoffs:
+        if game_map.calculate_distance(pos, p) < disthome:
+            disthome = game_map.calculate_distance(pos, p)
+            result = p
+    return result, disthome
+
+def getfuturedisthome(pos):
+    result,disthome = getdisthome(pos)
+    for p in dropoff_requests:
+        if  pos != dropoff_requests[p] and game_map.calculate_distance(pos, dropoff_requests[p]) < disthome:
+            disthome = game_map.calculate_distance(pos, dropoff_requests[p])
+            result = p
+    return result, disthome
+
+def generatetargets():
+    global dropoffs
+    global dropoff_requests
+    global tardict
+    global customranks
+    tdict = {}
+    while len(tdict) != len(shipids) and not customranks.empty():
+        ttar = None
+        while not customranks.empty():
+            ttar = customranks.get()
+            if ttar and ttar not in dropoffs:
+                break
+        bestship = None
+        dist = 10000
+        for ship in me.get_ships():
+            tdist = game_map.calculate_distance(ship.position,ttar)
+            if (ship.id not in tdict or tdist < game_map.calculate_distance(ship.position,tdict[ship.id])) and tdist < dist:
+                if ship.id in dropoff_requests:
+                    if ship.id not in tdict and ship.id in tardict:
+                        tdict[ship.id] = tardict[ship.id]
+                    continue
+                elif ship.id in tardict and tardict[ship.id] in dropoffs and ship.position != tardict[ship.id]:
+                    if ship.id not in tdict:
+                        tdict[ship.id] = tardict[ship.id]
+                    continue
+                else:
+                    bestship = ship
+                    dist = tdist
+        if bestship:
+            if bestship.id in tdict and (not ship.id in tardict or tardict[ship.id] not in dropoffs):
+                home, dist = getfuturedisthome(tdict[bestship.id])
+                if dist > 0:
+                    customranks.put(tdict[bestship.id], -1 * game_map[tdict[bestship.id]].halite_amount / (0.5 * dist))
+            tdict[bestship.id] = ttar
+    return tdict
+
+def tempaction(ship,tar, has_moved, oship, disthome,ttar):
+    global temp_targets
+    global movers
+    global collected
+    global turn
+    global ending
+    logging.info("attempting alternate action")
+    #If there's less than (10 + # of turns to return home) than ignore enemy ships in front and move towards home
+    if ttar in dropoffs and (disthome + 10 >= constants.MAX_TURNS - turn or ship.id in ending):
+        logging.info("Forced alt move home")
+        command_queue.append(ship.move(game_map.get_unsafe_moves(ship.position, ttar)[0]))
+        temp_targets.append(ttar)
+        movers.append(ship.id)
+        ending.append(ship.id)
+        # Log ship halite, if the ship will move onto a dropoff and deposit halite
+        if ttar in dropoffs:
+            collected += ship.halite_amount
+    #Otherwise see if nearby cells are open to move to and beneficial
+    else:
+        #If this ship is trying to get to a mining target find the largest halite tile nearby that the ship can move to
+        if tar not in dropoffs:
+            logging.info("Attempting alt mine move")
+            tbest = PriorityQueue()
+            for atar in ship.position.get_surrounding_cardinals():
+                #If the ship can reach it add it to the PQ and sort by halite amount (most to least)
+                if game_map.calculate_distance(ship.position, atar) == 1:
+                    tbest.put(atar, -1 * game_map[atar].halite_amount)
+            ttar = ship.position
+            #Try and get a cell that isn't already being moved to and won't have anyone occupying it next turn
+            while not tbest.empty():
+                atar = tbest.get()
+                if atar and atar not in temp_targets:
+                    oship = game_map[atar].ship
+                    if not game_map[atar].is_occupied:
+                        has_moved.append(ship.id)
+                        #Cell isn't occupied and no one is moving in
+                        ttar = atar
+                        break
+                    elif oship.id in path and str(atar) in path[oship.id]:
+                        #Simulate the current ship having moved to free up the cell this ship is on
+                        has_moved.append(ship.id)
+                        #If the occupying friendly ship hasn't moved, ask it to make moves
+                        if not oship.id in has_moved:
+                            movers.append(ship.id)
+                            has_moved = action(oship, has_moved)
+                        #If friendly ship has moved out and no other ship is moving into target cell, move the ship
+                        if oship.id in movers and atar not in temp_targets:
+                            # Cell is occupied but occupier is moving out and no one is moving in
+                            ttar = atar
+                            break
+            #If an alternative cell was found move to it
+            if ttar != ship.position:
+                if ship.id not in movers:
+                    movers.append(ship.id)
+                logging.info(str(ship.id) + " alt mine move")
+                command_queue.append(ship.move(game_map.get_unsafe_moves(ship.position, ttar)[0]))
+                temp_targets.append(ttar)
+                #Log ship halite, if the ship will move onto a dropoff and deposit halite
+                if ttar in dropoffs:
+                    collected += ship.halite_amount
+            else:
+                logging.info(str(ship.id) + " no alt mine move found")
+                command_queue.append(ship.stay_still())
+                has_moved.append(ship.id)
+        #If this ship is trying to get home, find a cell that the ship can move to that will get it closer to home
+        else:
+            logging.info("Attempting alt home move")
+            ttar = ship.position
+            for atar in ship.position.get_surrounding_cardinals():
+                if atar not in temp_targets and game_map.calculate_distance(atar, ttar) < game_map.calculate_distance(ship.position, atar):
+                    if not game_map[atar].is_occupied:
+                        has_moved.append(ship.id)
+                        #Cell isn't occupied and no one is moving in
+                        ttar = atar
+                        break
+                    elif oship.id in path and str(atar) in path[oship.id]:
+                        #Simulate the current ship having moved to free up the cell this ship is on
+                        has_moved.append(ship.id)
+                        #If the occupying friendly ship hasn't moved, ask it to make moves
+                        if not oship.id in has_moved:
+                            movers.append(ship.id)
+                            has_moved = action(oship, has_moved)
+                        #If friendly ship has moved out and no other ship is moving into target cell, move the ship
+                        if oship.id in movers and atar not in temp_targets:
+                            # Cell is occupied but occupier is moving out and no one is moving in
+                            ttar = atar
+                            break
+            # If an alternative cell was found move to it
+            if ttar != ship.position:
+                if ship.id not in movers:
+                    movers.append(ship.id)
+                logging.info(str(ship.id) + " alt home move")
+                command_queue.append(ship.move(game_map.get_unsafe_moves(ship.position, ttar)[0]))
+                temp_targets.append(ttar)
+                #Log ship halite, if the ship will move onto a dropoff and deposit halite
+                if ttar in dropoffs:
+                    collected += ship.halite_amount
+            else:
+                logging.info(str(ship.id) + " no alt mine move found")
+                command_queue.append(ship.stay_still())
+                has_moved.append(ship.id)
+    if ship.id not in has_moved:
+        has_moved.append(ship.id)
+    return has_moved
+
+def action(ship,has_moved):
+    global collected
+    global halite_modifier
+    global dropoffs
+    global movers
+    global tardict
+    global turn
+    global avg_remaining_halite
+    home, disthome = getdisthome(ship.position)
+    #Build a dropoff if ship requested one and there is enough halite
+    if ship.id in dropoff_requests and me.halite_amount - halite_modifier + ship.halite_amount + game_map[ship.position].halite_amount >= constants.DROPOFF_COST:
+        logging.info(str(ship.id) + " built a dropoff from request")
+        command_queue.append(ship.make_dropoff())
+        dropoffs.append(ship.position)
+        del dropoff_requests[ship.id]
+        has_moved.append(ship.id)
+        movers.append(ship.id)
+        halite_modifier += constants.DROPOFF_COST
+        return has_moved
+    #If ship requested dropoff don't move
+    if ship.id in dropoff_requests:
+        command_queue.append(ship.stay_still())
+        has_moved.append(ship.id)
+        logging.info(str(ship.id) + " staying still due to dropoff request")
+        return has_moved
+    #Check if ship should request dropoff
+    if game_map.getdensity(ship.position,5) > 200 and getfuturedisthome(ship.position)[1] >= 15 and len(shipids) > 15:
+            has_moved.append(ship.id)
+            #Check if can immediately build one this turn
+            if me.halite_amount - halite_modifier + ship.halite_amount + game_map[ship.position].halite_amount >= constants.DROPOFF_COST:
+                command_queue.append(ship.make_dropoff())
+                dropoffs.append(ship.position)
+                movers.append(ship.id)
+                halite_modifier += constants.DROPOFF_COST
+                logging.info(str(ship.id) + " built a dropoff immediately")
+            #Otherwise file a request to build one in the future
+            else:
+                logging.info(str(ship.id) + " requested a dropoff")
+                dropoff_requests[ship.id] = ship.position
+                command_queue.append(ship.stay_still())
+            return has_moved
+    #Check if ship should return home (enough to get 500 halite profit upon returning home or over 800 halite)
+    elif ship.halite_amount - disthome * getcost(ship.position) / 10 > 500  or ship.halite_amount > 800 \
+            or  disthome + 10 >= constants.MAX_TURNS - turn or ship.id in ending:
+            tardict[ship.id] = home
+            if disthome + 10 >= constants.MAX_TURNS - turn and ship.id not in ending:
+                ending.append(ship.id)
+            logging.info("Target is a dropoff:")
+    #Otherwise use current target from updating
+    tar = tardict[ship.id]
+    logging.info(str(ship.id) + " is moving to " + str(tar))
+    if ship.position != tar:
+        #Create a path to the target if one doesn't already exist
+        if ship.id not in path or tar not in path[ship.id]:
+            if tar in dropoffs:
+                logging.info("generated new path to return")
+                path[ship.id] = pathfindhome(ship.position, tar)
+            else:
+                logging.info("generated new path to mine")
+                path[ship.id] = pathfind(ship.position, tar)
+        #If the ship can move and there isn't too much halite under the ship / ship is almost full
+        if ship.id in path and ship.halite_amount >= game_map[ship.position].halite_amount / 10 and \
+                (ship.halite_amount > 900 or game_map[ship.position].halite_amount < min(75,avg_remaining_halite)):
+            #Target cell to move to next turn
+            ttar = path[ship.id][str(ship.position)]
+            #Whether target cell is occupied
+            occupied = game_map[path[ship.id][str(ship.position)]].is_occupied
+            #Ship object located at the target cell (None if not occupied)
+            oship = game_map[path[ship.id][str(ship.position)]].ship
+            #If no other friendly ship is moving to target cell:
+            if ttar not in temp_targets:
+                #If the target cell is not occupied than it's safe to move
+                if not occupied:
+                    movers.append(ship.id)
+                    command_queue.append(ship.move(game_map.get_unsafe_moves(ship.position, ttar)[0]))
+                    temp_targets.append(ttar)
+                    has_moved.append(ship.id)
+                    if ttar in dropoffs:
+                        collected += ship.halite_amount
+                    logging.info(str(ship.id) + " initial move into empty cell")
+                    return has_moved
+                #If the target cell is occupied by a friendly ship who has a path containing the cell
+                elif oship.id in path and (str(ttar) in path[oship.id] or ttar == tardict[oship.id]):
+                    #Simulate the current ship having moved to free up the cell this ship is on
+                    has_moved.append(ship.id)
+                    #If the occupying friendly ship hasn't moved, ask it to make moves
+                    if not oship.id in has_moved:
+                        logging.info(str(ship.id) + " simulating on " + str(oship.id))
+                        movers.append(ship.id)
+                        has_moved = action(oship, has_moved)
+                    #If friendly ship has moved out and no other ship is moving into target cell, move the ship
+                    if oship.id in movers and ttar not in temp_targets:
+                        if ship.id not in movers:
+                            movers.append(ship.id)
+                        logging.info(str(ship.id) + " initial move into vacated cell")
+                        command_queue.append(ship.move(game_map.get_unsafe_moves(ship.position, ttar)[0]))
+                        temp_targets.append(ttar)
+                        #Log ship halite, if the ship will move onto a dropoff and deposit halite
+                        if ttar in dropoffs:
+                            collected += ship.halite_amount
+                    #Otherwise end the simulation and see if ship can move to other surrounding tiles
+                    else:
+                        if ship.id in movers:
+                            movers.remove(ship.id)
+                        logging.info(str(ttar) + " could not be vacated")
+                        return tempaction(ship,tar,has_moved,oship,disthome,ttar)
+                else:
+                    logging.info(str(ttar) + " none friendly or cell not in ship path")
+                    if collisions(ship,oship,ttar):
+                        if ship.id not in movers:
+                            movers.append(ship.id)
+                        logging.info("Satisfactory collision opportunity cost")
+                        command_queue.append(ship.move(game_map.get_unsafe_moves(ship.position, ttar)[0]))
+                        temp_targets.append(ttar)
+                        if ttar in dropoffs:
+                            collected += ship.halite_amount
+                    else:
+                        logging.info("Unsatisfactory collision opportunity cost")
+                        command_queue.append(ship.stay_still())
+            else:
+                logging.info(str(ttar) + " is already a target for another ship")
+                return tempaction(ship, tar, has_moved, oship, disthome,ttar)
+        else:
+            logging.info(str(ship.id) + " failed the criteria to move at tile " + str(ship.position) + " " + str(game_map[ship.position].halite_amount))
+            logging.info("Path: " + str(ship.id in path) + ", Fuel: " + \
+            str(ship.halite_amount >= game_map[ship.position].halite_amount / 10)  + ", Halite > 900: " + \
+            str(ship.halite_amount > 900) + ", Tile Halite Requirement: " + str(min(75,avg_remaining_halite)))
+            command_queue.append(ship.stay_still())
+        has_moved.append(ship.id)
+
+
+    else:
+        logging.info(str(ship.id) + " is at target position")
+        command_queue.append(ship.stay_still())
+        has_moved.append(ship.id)
+    return has_moved
+
+def getnearbyships(pos, pid, dist, min = 0, max = 1000):
+    count = 0
+    for x in range(pos.x - dist, pos.x + dist + 1):
+        for y in range(pos.y - dist, pos.y + dist + 1):
+            temp = game_map.normalize(hlt.Position(x, y))
+            ship = game_map[temp].ship
+            if ship and ship.owner == pid and ship.halite_amount >= min and ship.halite_amount <= max:
+                count += 1
+    return count
+
+def collisions(ship, oship, tar):
+    if ship.owner == oship.owner or len(me.get_ships()) < 15:
+        return False
+    if tar in dropoffs:
+       return True
+    halite = game_map[tar].halite_amount
+    return ship.halite_amount <= oship.halite_amount - 100 and \
+    getnearbyships(tar,ship.id,2,0,1100 - halite * 0.25) > getnearbyships(tar,oship.id,2,0,1100 - halite * 0.25)
+
+def bestcells():
+    ranks = PriorityQueue()
+    for row in game_map.getcells():
+        for cell in row:
+            home,dist = getfuturedisthome(cell.position)
+            if dist > 0:
+                ranks.put(cell.position,-1 * cell.halite_amount / (0.75 * dist))
+    return ranks
+turn = 0
+ranksbyhalite = []
+customranks = []
+longesttime = 0
+longestturn = 0
+for p in game.players:
+    for d in game.players[p].get_dropoffs():
+        alldropoffs.append(d.position)
+while True:
+    t = int(round(time.time() * 1000))
+    game.update_frame()
+    remaining_halite,ranksbyhalite = game.game_map.get_total_halite()
+    avg_remaining_halite = remaining_halite / (game_map.width * game_map.height)
+    me = game.me
+    shipids = []
+    for ship in me.get_ships():
+        shipids.append(ship.id)
+    total_turtles = len(me.get_ships())
+    logging.info("Total Halite Collected: " + str(collected))
+    logging.info("Possessed Halite: " + str(me.halite_amount))
+    logging.info("Remaining Halite on Map: " + str(remaining_halite))
+    logging.info("Percent Map Halite Collected: " + str(1.0 * (total_halite-remaining_halite) / total_halite))
+    logging.info("Avg halite per tile: " + str(remaining_halite / (game_map.width * game_map.height)))
+    logging.info("Number of ships: " + str(len(me.get_ships())))
+    logging.info("Ship Ids" + str(shipids))
+    logging.info("Dropoff Locations: " + str(dropoffs))
+    logging.info("Longest Time: " + str(longesttime))
+    logging.info("Longest Turn: " + str(longestturn))
+    halite_modifier = 0
+    game_map = game.game_map
+    command_queue = []
+    temp_targets = []
+    movers = []
+    has_moved = []
+    customranks = bestcells()
+    tardict = generatetargets()
+    for p in dropoff_requests:
+        if p not in shipids:
+            del dropoff_requests[p]
+
+    if len(dropoff_requests) == 0 and me.halite_amount - halite_modifier >= constants.SHIP_COST and \
+        1.0 * (total_halite-remaining_halite) / total_halite < 0.5 and turn < constants.MAX_TURNS /4 * 3:
+        if not game_map[me.shipyard].is_occupied:
+            command_queue.append(me.shipyard.spawn())
+            temp_targets.append(game_map[me.shipyard].position)
+            used_halite += constants.SHIP_COST
+            halite_modifier += constants.SHIP_COST
+        else:
+            ship = game_map[game_map[me.shipyard].position].ship
+            if ship in me.get_ships():
+                action(ship,has_moved)
+            if  ship not in me.get_ships() or (ship.id in movers and game_map[me.shipyard].position not in temp_targets):
+                command_queue.append(me.shipyard.spawn())
+                temp_targets.append(game_map[me.shipyard].position)
+                used_halite += constants.SHIP_COST
+                halite_modifier += constants.SHIP_COST
+    for ship in me.get_ships():
+        if not ship.id in has_moved:
+            has_moved = action(ship,has_moved)
+    logging.info(command_queue)
+    game.end_turn(command_queue)
+    turn += 1
+    end_turn = time.time()
+    if int(round(end_turn * 1000)) - t > longesttime:
+        longesttime = int(round(end_turn * 1000)) - t
+        longestturn = turn - 1
+    logging.info("Time Taken in ms: " + str(int(round(end_turn * 1000)) - t))
+    if False:
+        sys.stderr.write("Time Taken in ms: " + str(int(round(end_turn * 1000)) - t))
